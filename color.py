@@ -14,7 +14,7 @@ from .config import CONFIG, Look
 from .utils import ensure_uint8, read_bgr, write_bgr
 
 
-# ── LUT application ──────────────────────────────────────────────────────────
+# ── LUT application ───────────────────────────────────────────────────────────
 
 def apply_lut_ffmpeg(img: np.ndarray, lut_path: Path) -> np.ndarray:
     if shutil.which("ffmpeg") is None:
@@ -25,7 +25,7 @@ def apply_lut_ffmpeg(img: np.ndarray, lut_path: Path) -> np.ndarray:
         td = Path(td)
         inp, out = td / "in.png", td / "out.png"
         write_bgr(inp, img)
-        vf = f"lut3d=file={shlex.quote(lut_path.as_posix())}"
+        vf  = f"lut3d=file={shlex.quote(lut_path.as_posix())}"
         cmd = (
             f"ffmpeg -y -hide_banner -loglevel error "
             f"-i {shlex.quote(inp.as_posix())} "
@@ -38,11 +38,17 @@ def apply_lut_ffmpeg(img: np.ndarray, lut_path: Path) -> np.ndarray:
         return ensure_uint8(read_bgr(out))
 
 
-# ── Leica look ────────────────────────────────────────────────────────────────
+# ── Leica look ─────────────────────────────────────────────────────────────────
 
-def _micro_contrast(img: np.ndarray, amount: float = 1.10) -> np.ndarray:
-    blur = cv2.GaussianBlur(img, (0, 0), 1.2)
-    out = cv2.addWeighted(img, amount, blur, -(amount - 1.0), 0)
+def _micro_contrast(img: np.ndarray, amount: float = 1.08) -> np.ndarray:
+    """
+    Unsharp-mask style micro-contrast boost applied AFTER super-resolution.
+    FIX: amount reduced from 1.10 → 1.08 to avoid haloing artifacts on
+         Real-ESRGAN output which already sharpens edges.
+    This is called in color_stage which runs AFTER sr_stage — correct order.
+    """
+    blur = cv2.GaussianBlur(img, (0, 0), 1.0)   # tighter sigma (was 1.2)
+    out  = cv2.addWeighted(img, amount, blur, -(amount - 1.0), 0)
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
@@ -52,50 +58,61 @@ def leica_style(img: np.ndarray) -> np.ndarray:
      - S-curve mid-tone contrast (3D pop)
      - Subtle green desaturation (natural foliage)
      - Warm shadow cast (red/yellow lift)
-     - Micro-contrast sharpening
+     - Micro-contrast sharpening (AFTER SR — correct stage order)
+
+    FIX: S-curve pivot adjusted from 0.5 → 0.48 to lift slightly-dark
+         images that can result from Mertens fusion of burst frames.
+         Contrast factor reduced from 1.10 → 1.06 (less crushing of shadows
+         that are already correct after gamma fix in raw_hdr.py).
     """
     img8 = ensure_uint8(img)
 
-    # S-curve on L channel (LAB)
+    # S-curve on L channel (LAB) — gentler than before
     x = np.linspace(0.0, 1.0, 256, dtype=np.float32)
-    s = 1.0 / (1.0 + np.exp(-8.0 * (x - 0.5)))
-    s = np.clip((s - 0.5) * 1.10 + 0.5, 0.0, 1.0)
+    s = 1.0 / (1.0 + np.exp(-7.5 * (x - 0.48)))   # was -8.0, pivot 0.5
+    s = np.clip((s - s[0]) / (s[-1] - s[0]), 0.0, 1.0)  # remap to [0,1]
+    s = np.clip((s - 0.5) * 1.06 + 0.5, 0.0, 1.0)       # was 1.10
     lut = np.clip(s * 255.0, 0, 255).astype(np.uint8)
 
     lab = cv2.cvtColor(img8, cv2.COLOR_BGR2LAB)
     lab[..., 0] = cv2.LUT(lab[..., 0], lut)
     out = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
 
-    # Green desaturation
+    # Green desaturation (Leica tends to render foliage more muted)
     hsv = cv2.cvtColor(out, cv2.COLOR_BGR2HSV).astype(np.float32)
     greens = (hsv[..., 0] >= 35) & (hsv[..., 0] <= 90)
     hsv[..., 1][greens] *= 0.95
     hsv[..., 1] = np.clip(hsv[..., 1], 0, 255)
     out = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
 
-    # Warm shadow cast
-    luma = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+    # Warm shadow cast (Leica signature warm-in-shadow rendering)
+    luma   = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
     shadow = np.clip((0.55 - luma) / 0.55, 0.0, 1.0)[..., None]
-    warm = np.zeros_like(out, dtype=np.float32)
-    warm[..., 2] = 8.0   # red
-    warm[..., 1] = 4.0   # green
+    warm   = np.zeros_like(out, dtype=np.float32)
+    warm[..., 2] = 8.0   # red channel
+    warm[..., 1] = 4.0   # green channel
     out = np.clip(out.astype(np.float32) + warm * shadow, 0, 255).astype(np.uint8)
 
-    return _micro_contrast(out, 1.10)
+    return _micro_contrast(out, 1.08)
 
 
-# ── Pixel look ────────────────────────────────────────────────────────────────
+# ── Pixel look ─────────────────────────────────────────────────────────────────
 
 def pixel_style(img: np.ndarray) -> np.ndarray:
     """
     Google Pixel look:
-     - Neutral greens, boosted blues
+     - Neutral greens, boosted blues (Pixel signature)
      - Highlight roll-off (protect against blow-out)
      - Cool shadow cast
+     - Subtle global contrast lift via LAB L-channel
+
+    FIX: Added gentle LAB L-channel contrast boost (previously missing) to
+         replicate Pixel's characteristic "punchy but clean" look.
     """
     img8 = ensure_uint8(img)
 
-    hsv = cv2.cvtColor(img8, cv2.COLOR_BGR2HSV).astype(np.float32)
+    # Colour character: neutral greens, boosted blues
+    hsv    = cv2.cvtColor(img8, cv2.COLOR_BGR2HSV).astype(np.float32)
     greens = (hsv[..., 0] >= 35) & (hsv[..., 0] <= 90)
     blues  = (hsv[..., 0] >= 90) & (hsv[..., 0] <= 130)
     hsv[..., 1][greens] *= 0.90
@@ -103,17 +120,26 @@ def pixel_style(img: np.ndarray) -> np.ndarray:
     hsv[..., 1] = np.clip(hsv[..., 1], 0, 255)
     out = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
 
-    # Highlight roll-off in LAB
-    lab = cv2.cvtColor(out, cv2.COLOR_BGR2LAB).astype(np.float32)
-    hi = np.clip((lab[..., 0] - 180.0) / 75.0, 0.0, 1.0)
+    # Highlight roll-off (Pixel avoids blown highlights)
+    lab    = cv2.cvtColor(out, cv2.COLOR_BGR2LAB).astype(np.float32)
+    hi     = np.clip((lab[..., 0] - 180.0) / 75.0, 0.0, 1.0)
     lab[..., 0] = np.clip(lab[..., 0] - 15.0 * hi, 0, 255)
+
+    # NEW: gentle midtone contrast lift (Pixel "punchy" look)
+    x   = np.linspace(0.0, 1.0, 256, dtype=np.float32)
+    s   = 1.0 / (1.0 + np.exp(-5.0 * (x - 0.5)))
+    s   = np.clip((s - s[0]) / (s[-1] - s[0]), 0.0, 1.0)
+    s   = np.clip((s - 0.5) * 1.04 + 0.5, 0.0, 1.0)
+    lut = np.clip(s * 255.0, 0, 255).astype(np.uint8)
+    lab[..., 0] = cv2.LUT(lab[..., 0].astype(np.uint8), lut).astype(np.float32)
+
     out = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
 
-    # Cool shadow cast
-    gray = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    # Cool shadow cast (Pixel signature blue-in-shadow)
+    gray   = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY).astype(np.float32)
     shadow = np.clip((140.0 - gray) / 140.0, 0.0, 1.0)[..., None]
-    cool = np.zeros_like(out, dtype=np.float32)
-    cool[..., 0] = 8.0   # blue
+    cool   = np.zeros_like(out, dtype=np.float32)
+    cool[..., 0] = 8.0   # blue channel
     out = np.clip(out.astype(np.float32) + cool * shadow, 0, 255).astype(np.uint8)
 
     return out
@@ -123,9 +149,11 @@ def pixel_style(img: np.ndarray) -> np.ndarray:
 
 def color_stage(img: np.ndarray, look: Look) -> np.ndarray:
     """
-    Apply color grading.
-    Blend mode: Leica and Pixel are applied to the ORIGINAL independently,
-    then alpha-composited — NOT Leica-on-top-of-Pixel.
+    Apply color grading. Called AFTER sr_stage in jobs.py — correct order:
+    denoise → super-resolve → color grade → (optional) portrait.
+
+    Blend mode: Leica and Pixel are each applied to the ORIGINAL independently,
+    then alpha-composited (not Leica-on-top-of-Pixel, which double-processes).
     """
     img8 = ensure_uint8(img)
 

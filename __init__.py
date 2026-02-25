@@ -1,5 +1,5 @@
 """Mobile Computational Photography Pipeline — public API."""
-from .config import CONFIG, STORAGE, JOB_STATUS, Mode, Look
+from .config import CONFIG, STORAGE, JOB_STATUS, Mode, Look, auto_configure_from_models
 from .assets import (
     MODEL_ASSETS, TMP_MODELS_DIR,
     setup_model_assets, set_model_url, print_download_summary,
@@ -10,6 +10,7 @@ from .web import app, start_server, stop_server
 
 __all__ = [
     "CONFIG", "STORAGE", "JOB_STATUS", "Mode", "Look",
+    "auto_configure_from_models",
     "MODEL_ASSETS", "TMP_MODELS_DIR",
     "setup_model_assets", "set_model_url", "print_download_summary",
     "JobRequest", "queue_job", "process_job", "gallery_items",
