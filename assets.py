@@ -121,9 +121,9 @@ def _has_tool(name: str) -> bool:
 
 
 def _download_wget(url: str, dst: Path) -> None:
-    """Download via wget with progress bar."""
+    """Download via wget without noisy terminal progress output."""
     subprocess.run(
-        ["wget", "--show-progress", "-q", str(url), "-O", str(dst)],
+        ["wget", "-q", str(url), "-O", str(dst)],
         check=True,
     )
 
